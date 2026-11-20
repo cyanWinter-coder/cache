@@ -120,3 +120,60 @@ func Example_advancedUsage() {
     // Output: &{mystring 42}
 }
 ```
+
+## Stale-while-revalidate
+
+For hot keys (for example configuration fetched on every request) a local
+cache entry that expires while Redis is briefly unavailable would otherwise
+make every instance fall back to the origin at the same time. `GetStale`
+implements a [stale-while-revalidate](https://en.wikipedia.org/wiki/Cache_stamping)
+read strategy with per-key windows:
+
+- `Fresh` is the window during which the local value is served directly
+  without contacting Redis.
+- `Stale` is the extra window after freshness expires during which the last
+  known value may still be served. At most **one** shared refresh runs per key;
+  other callers receive the stale value immediately or wait for that refresh,
+  so there is no stampede.
+- After `Fresh + Stale` (the absolute deadline) old data is never returned and
+  callers wait for the refresh, receiving its error if it cannot produce a
+  value.
+
+The result carries a `Source` (`Fresh`, `Stale` or `Refresh`) so callers know
+where the value came from. Cancelling the request context unblocks the caller
+but never cancels a shared refresh that has already started, and successful
+refreshes replace the local and Redis versions atomically: an older
+late-arriving result can never overwrite a newer value.
+
+```go
+var obj Object
+res, err := mycache.GetStale(&cache.StaleItem{
+    Ctx:   ctx,
+    Key:   "hot-config",
+    Value: &obj,
+    Fresh: time.Minute,     // serve directly for a minute
+    Stale: 10 * time.Minute, // then tolerate up to ten minutes of staleness
+    Do: func(*cache.StaleItem) (interface{}, error) {
+        return loadConfigFromOrigin()
+    },
+})
+if err != nil {
+    panic(err)
+}
+fmt.Println(res.Source, obj) // cache.Fresh | cache.Stale | cache.Refresh
+```
+
+Notes on semantics:
+
+- A Redis error does not invalidate a value still inside its stale window; the
+  value keeps being served until the absolute deadline.
+- When `Do` is nil, `GetStale` only reads through Redis and returns
+  `cache.ErrCacheMiss` (or the Redis error) when no usable value exists.
+- `GetStale` keeps its own versioned state inside `Cache`. It does not read
+  from or write to `Options.LocalCache`, and the existing `Get`, `Once`, `Set`
+  and `Delete` APIs keep their original behavior. `Delete` also invalidates the
+  stale-while-revalidate state so an in-flight refresh cannot resurrect a
+  deleted key.
+- A value that fails to unmarshal is evicted and replaced through a single
+  shared refresh, mirroring the self-healing behavior of `Once`.
+

@@ -115,6 +115,9 @@ type Cache struct {
 
 	group singleflight.Group
 
+	// stale holds the versioned stale-while-revalidate state used by GetStale.
+	stale *staleStore
+
 	marshal   MarshalFunc
 	unmarshal UnmarshalFunc
 
@@ -124,7 +127,8 @@ type Cache struct {
 
 func New(opt *Options) *Cache {
 	cacher := &Cache{
-		opt: opt,
+		opt:   opt,
+		stale: newStaleStore(),
 	}
 
 	if opt.Marshal == nil {
@@ -307,6 +311,9 @@ func (cd *Cache) Delete(ctx context.Context, key string) error {
 	if cd.opt.LocalCache != nil {
 		cd.opt.LocalCache.Del(key)
 	}
+	// Evict the stale-while-revalidate state as well and bump its version,
+	// so a refresh already in flight cannot resurrect the deleted key.
+	cd.stale.delete(key)
 
 	if cd.opt.Redis == nil {
 		if cd.opt.LocalCache == nil {
@@ -323,6 +330,7 @@ func (cd *Cache) DeleteFromLocalCache(key string) {
 	if cd.opt.LocalCache != nil {
 		cd.opt.LocalCache.Del(key)
 	}
+	cd.stale.delete(key)
 }
 
 func (cd *Cache) Marshal(value interface{}) ([]byte, error) {
